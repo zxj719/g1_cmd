@@ -1,0 +1,7 @@
+g1_p2r_cmd:
+  ros__parameters:
+    channel_name: enP8p1s0
+
+g1_move:
+  ros__parameters:
+    channel_name: enP8p1s0
