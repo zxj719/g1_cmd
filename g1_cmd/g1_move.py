@@ -47,7 +47,7 @@ class G1MoveNode(Node):
         self.declare_parameter("compensation_duration", 0.5)
         self.declare_parameter("compensation_factor", 1.5)
         self.declare_parameter("yaw_deadband", 0.3)
-        self.declare_parameter("min_yaw_command", 0.31)
+        self.declare_parameter("min_yaw_command", 0.35)
 
         self.compensation_enabled = bool(
             self.get_parameter("compensation_enabled").value
