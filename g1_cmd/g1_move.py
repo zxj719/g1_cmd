@@ -6,6 +6,7 @@ CycloneDDS conflicts. Commands are exchanged through shared memory.
 """
 
 import multiprocessing as mp
+import math
 import os
 import time
 
@@ -35,6 +36,79 @@ DEFAULT_CONTROL_HZ = 50.0
 DEFAULT_LOG_PERIOD = 0.5
 
 
+def apply_planar_deadband(vx, vy, linear_deadband, min_linear_command):
+    """Scale small planar commands up to the minimum actionable magnitude."""
+    planar_speed = math.hypot(vx, vy)
+    if (
+        planar_speed <= 0.0
+        or linear_deadband <= 0.0
+        or min_linear_command <= 0.0
+        or planar_speed >= linear_deadband
+    ):
+        return vx, vy
+
+    scale = min_linear_command / planar_speed
+    return vx * scale, vy * scale
+
+
+def apply_command_timeout(vx, vy, vyaw, command_age, timeout):
+    """Drop stale velocity commands instead of replaying the last twist forever."""
+    if timeout > 0.0 and command_age > timeout:
+        return 0.0, 0.0, 0.0
+
+    return vx, vy, vyaw
+
+
+class LowSpeedPulseController:
+    """Convert a tiny linear command into one bounded startup pulse."""
+
+    def __init__(self, linear_deadband, min_linear_command, pulse_duration):
+        self.linear_deadband = float(linear_deadband)
+        self.min_linear_command = float(min_linear_command)
+        self.pulse_duration = float(pulse_duration)
+        self._pulse_end_time = None
+        self._pulse_vx = 0.0
+        self._pulse_vy = 0.0
+        self._latched = False
+
+    def reset(self):
+        self._pulse_end_time = None
+        self._pulse_vx = 0.0
+        self._pulse_vy = 0.0
+        self._latched = False
+
+    def update(self, vx, vy, now_sec):
+        planar_speed = math.hypot(vx, vy)
+        if (
+            planar_speed <= 0.0
+            or self.linear_deadband <= 0.0
+            or self.min_linear_command <= 0.0
+            or self.pulse_duration <= 0.0
+        ):
+            self.reset()
+            return vx, vy
+
+        if planar_speed >= self.linear_deadband:
+            self.reset()
+            return vx, vy
+
+        if self._latched and (vx * self._pulse_vx + vy * self._pulse_vy) <= 0.0:
+            self.reset()
+
+        if not self._latched:
+            scale = self.min_linear_command / planar_speed
+            self._pulse_vx = vx * scale
+            self._pulse_vy = vy * scale
+            self._pulse_end_time = float(now_sec) + self.pulse_duration
+            self._latched = True
+            return self._pulse_vx, self._pulse_vy
+
+        if float(now_sec) < self._pulse_end_time:
+            return self._pulse_vx, self._pulse_vy
+
+        return 0.0, 0.0
+
+
 class G1MoveNode(Node):
     """Subscribe to cmd_vel and mirror the latest command into shared memory."""
 
@@ -46,6 +120,11 @@ class G1MoveNode(Node):
         self.declare_parameter("compensation_enabled", True)
         self.declare_parameter("compensation_duration", 0.5)
         self.declare_parameter("compensation_factor", 1.5)
+        self.declare_parameter("linear_deadband", 0.15)
+        self.declare_parameter("min_linear_command", 0.3)
+        self.declare_parameter("linear_pulse_enabled", True)
+        self.declare_parameter("linear_pulse_duration", 0.45)
+        self.declare_parameter("cmd_vel_timeout", 0.25)
         self.declare_parameter("yaw_deadband", 0.3)
         self.declare_parameter("min_yaw_command", 0.35)
 
@@ -62,11 +141,27 @@ class G1MoveNode(Node):
         self.control_hz = DEFAULT_CONTROL_HZ
         self.log_period = DEFAULT_LOG_PERIOD
 
+        self.linear_deadband = float(self.get_parameter("linear_deadband").value)
+        self.min_linear_command = float(
+            self.get_parameter("min_linear_command").value
+        )
+        self.linear_pulse_enabled = bool(
+            self.get_parameter("linear_pulse_enabled").value
+        )
+        self.linear_pulse_duration = float(
+            self.get_parameter("linear_pulse_duration").value
+        )
+        self.cmd_vel_timeout = float(self.get_parameter("cmd_vel_timeout").value)
         self.yaw_deadband = float(self.get_parameter("yaw_deadband").value)
         self.min_yaw_command = float(self.get_parameter("min_yaw_command").value)
         self.max_vx = 0.4
         self.max_vy = 0.2
         self.max_vyaw = 1.0
+        self.low_speed_pulse_controller = LowSpeedPulseController(
+            self.linear_deadband,
+            self.min_linear_command,
+            self.linear_pulse_duration,
+        )
 
         self.last_raw_yaw = 0.0
         self.last_yaw_time = self.get_clock().now()
@@ -76,6 +171,7 @@ class G1MoveNode(Node):
         self.accumulated_yaw_error = 0.0
 
         self.latest_twist = Twist()
+        self.last_cmd_time = self.get_clock().now()
         self.heartbeat = 0
         self.last_motion_state = False
         self.last_log_time = self.get_clock().now()
@@ -108,6 +204,10 @@ class G1MoveNode(Node):
 
         self.get_logger().info(
             f"g1_move ready: control_hz={self.control_hz:.1f}, "
+            f"linear_deadband={self.linear_deadband:.2f}, "
+            f"linear_pulse_enabled={self.linear_pulse_enabled}, "
+            f"linear_pulse_duration={self.linear_pulse_duration:.2f}, "
+            f"cmd_vel_timeout={self.cmd_vel_timeout:.2f}, "
             f"yaw_deadband={self.yaw_deadband:.2f}"
         )
 
@@ -116,9 +216,11 @@ class G1MoveNode(Node):
         if msg.data in mode_map:
             self.shared_arr[IDX_MODE] = mode_map[msg.data]
             self.reset_compensation_state()
+            self.low_speed_pulse_controller.reset()
 
     def velocity_callback(self, msg):
         self.latest_twist = msg
+        self.last_cmd_time = self.get_clock().now()
 
     def reset_compensation_state(self):
         self.continuous_small_yaw_time = 0.0
@@ -177,10 +279,29 @@ class G1MoveNode(Node):
 
     def control_loop(self):
         current_time = self.get_clock().now()
+        command_age = (current_time - self.last_cmd_time).nanoseconds / 1e9
 
-        vx = max(min(self.latest_twist.linear.x, self.max_vx), -self.max_vx)
-        vy = max(min(self.latest_twist.linear.y, self.max_vy), -self.max_vy)
-        vyaw = self.latest_twist.angular.z
+        raw_vx = max(min(self.latest_twist.linear.x, self.max_vx), -self.max_vx)
+        raw_vy = max(min(self.latest_twist.linear.y, self.max_vy), -self.max_vy)
+        raw_vyaw = self.latest_twist.angular.z
+        raw_vx, raw_vy, raw_vyaw = apply_command_timeout(
+            raw_vx,
+            raw_vy,
+            raw_vyaw,
+            command_age,
+            self.cmd_vel_timeout,
+        )
+        now_sec = current_time.nanoseconds / 1e9
+        if self.linear_pulse_enabled:
+            vx, vy = self.low_speed_pulse_controller.update(raw_vx, raw_vy, now_sec)
+        else:
+            vx, vy = apply_planar_deadband(
+                raw_vx,
+                raw_vy,
+                self.linear_deadband,
+                self.min_linear_command,
+            )
+        vyaw = raw_vyaw
 
         linear_motion = abs(vx) > 0.03 or abs(vy) > 0.03
 
