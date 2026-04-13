@@ -1,10 +1,46 @@
 import math
 
 from g1_cmd.g1_move import (
+    G1MoveNode,
     LowSpeedPulseController,
     apply_command_timeout,
     apply_planar_deadband,
 )
+
+
+class FakeTime:
+    def __init__(self, seconds):
+        self.seconds = float(seconds)
+
+    def __sub__(self, other):
+        return type("FakeDuration", (), {"nanoseconds": int((self.seconds - other.seconds) * 1e9)})()
+
+
+class FakeLogger:
+    def warn(self, _msg):
+        return None
+
+
+def make_yaw_node():
+    node = object.__new__(G1MoveNode)
+    node.last_raw_yaw = 0.0
+    node.last_yaw_time = FakeTime(0.0)
+    node.continuous_small_yaw_time = 0.0
+    node.last_small_yaw_sign = 0
+    node.compensation_active = False
+    node.accumulated_yaw_error = 0.0
+    node.compensation_enabled = True
+    node.compensation_duration = 0.5
+    node.compensation_factor = 1.5
+    node.yaw_deadband = 0.3
+    node.min_yaw_command = 0.35
+    node.stationary_yaw_immediate_threshold = 0.1
+    node.max_vyaw = 1.0
+    node.get_logger = lambda: FakeLogger()
+    node.reset_compensation_state = G1MoveNode.reset_compensation_state.__get__(
+        node, G1MoveNode
+    )
+    return node
 
 
 def test_zero_velocity_stays_zero():
@@ -87,3 +123,15 @@ def test_command_timeout_zeros_stale_velocity():
         0.0,
         0.0,
     )
+
+
+def test_small_stationary_yaw_is_promoted_immediately():
+    node = make_yaw_node()
+
+    assert node.smart_yaw_deadband(0.2, FakeTime(0.0), linear_motion=False) == 0.35
+
+
+def test_tiny_stationary_yaw_still_waits_for_delayed_compensation():
+    node = make_yaw_node()
+
+    assert node.smart_yaw_deadband(0.05, FakeTime(0.0), linear_motion=False) == 0.0

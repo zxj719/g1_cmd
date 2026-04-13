@@ -127,6 +127,7 @@ class G1MoveNode(Node):
         self.declare_parameter("cmd_vel_timeout", 0.25)
         self.declare_parameter("yaw_deadband", 0.3)
         self.declare_parameter("min_yaw_command", 0.35)
+        self.declare_parameter("stationary_yaw_immediate_threshold", 0.1)
 
         self.compensation_enabled = bool(
             self.get_parameter("compensation_enabled").value
@@ -154,6 +155,9 @@ class G1MoveNode(Node):
         self.cmd_vel_timeout = float(self.get_parameter("cmd_vel_timeout").value)
         self.yaw_deadband = float(self.get_parameter("yaw_deadband").value)
         self.min_yaw_command = float(self.get_parameter("min_yaw_command").value)
+        self.stationary_yaw_immediate_threshold = float(
+            self.get_parameter("stationary_yaw_immediate_threshold").value
+        )
         self.max_vx = 0.4
         self.max_vy = 0.2
         self.max_vyaw = 1.0
@@ -208,7 +212,9 @@ class G1MoveNode(Node):
             f"linear_pulse_enabled={self.linear_pulse_enabled}, "
             f"linear_pulse_duration={self.linear_pulse_duration:.2f}, "
             f"cmd_vel_timeout={self.cmd_vel_timeout:.2f}, "
-            f"yaw_deadband={self.yaw_deadband:.2f}"
+            f"yaw_deadband={self.yaw_deadband:.2f}, "
+            f"stationary_yaw_immediate_threshold="
+            f"{self.stationary_yaw_immediate_threshold:.2f}"
         )
 
     def command_callback(self, msg):
@@ -243,6 +249,13 @@ class G1MoveNode(Node):
             return self.min_yaw_command * (1 if raw_yaw > 0.0 else -1)
 
         current_sign = 1 if raw_yaw > 0 else -1
+
+        # Navigation often finishes large heading changes with in-place yaw
+        # commands around 0.1~0.2 rad/s. Treat those as deliberate turns and
+        # promote them immediately instead of inserting a 0.5 s stop.
+        if abs(raw_yaw) >= self.stationary_yaw_immediate_threshold:
+            self.reset_compensation_state()
+            return self.min_yaw_command * current_sign
 
         if current_sign == self.last_small_yaw_sign:
             time_diff = (current_time - self.last_yaw_time).nanoseconds / 1e9
